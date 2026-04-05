@@ -13,6 +13,7 @@ Protocol:
 
   Python can also push unsolicited events:
                   { "event": "games_update", "data": [...] }
+                  { "event": "cache_ready",  "data": {"status": "ready"} }
                   { "event": "auth_step",    "data": {...} }
 """
 
@@ -105,6 +106,27 @@ class BaddelSteamBridge:
         self._times_cache = TimesCache()
         self._friends_cache = FriendsCache()
         self._translations_cache: Dict[int, str] = {}
+
+        # Wire the cache_ready callback so Electron knows exactly when PICS
+        # has finished and games are available — no polling needed.
+        #
+        # _update_ready_state() is called from a worker thread (asyncio_0),
+        # so we cannot use ensure_future() or create_task() directly.
+        # Instead we capture the running loop here (on the main async thread)
+        # and use call_soon_threadsafe() to safely schedule the coroutine
+        # from whatever thread fires the callback.
+        _main_loop = asyncio.get_event_loop()
+
+        async def _on_games_cache_ready():
+            logger.info("Games cache is ready — pushing cache_ready event to Electron")
+            await self._push_event("cache_ready", {"status": "ready"})
+
+        def _on_games_cache_ready_threadsafe():
+            _main_loop.call_soon_threadsafe(
+                lambda: _main_loop.create_task(_on_games_cache_ready())
+            )
+
+        self._games_cache.on_ready_callback = _on_games_cache_ready_threadsafe
 
         # ── Presence handler: push to Electron ────────────────────────────────
         async def _presence_handler(user_id: str, proto_user_info: ProtoUserInfo):

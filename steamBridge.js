@@ -10,6 +10,7 @@
 //   const bridge = require('./steamBridge');
 //   await bridge.start();
 //   const result = await bridge.authenticate(storedCreds);
+//   await bridge.waitForCacheReady();
 //   const { games } = await bridge.getOwnedGames();
 // ============================================================
 
@@ -48,12 +49,13 @@ function _findPython() {
 class SteamBridge extends EventEmitter {
     constructor() {
         super();
-        this._proc       = null;
-        this._ready      = false;
-        this._pendingCalls = new Map();   // id → { resolve, reject }
-        this._nextId     = 1;
-        this._buffer     = '';
+        this._proc              = null;
+        this._ready             = false;
+        this._pendingCalls      = new Map();   // id → { resolve, reject }
+        this._nextId            = 1;
+        this._buffer            = '';
         this._shutdownRequested = false;
+        this._cacheIsReady      = false;       // true once Python fires cache_ready
     }
 
     // ── Lifecycle ──────────────────────────────────────────────
@@ -90,8 +92,9 @@ class SteamBridge extends EventEmitter {
 
         this._proc.on('exit', (code, signal) => {
             console.warn(`[SteamBridge] Python process exited: code=${code} signal=${signal}`);
-            this._proc  = null;
-            this._ready = false;
+            this._proc         = null;
+            this._ready        = false;
+            this._cacheIsReady = false;
             this._rejectAll('Steam bridge process exited unexpectedly');
             if (!this._shutdownRequested) {
                 this.emit('disconnected', { code, signal });
@@ -118,7 +121,8 @@ class SteamBridge extends EventEmitter {
             this._proc.stdin.end();
             this._proc = null;
         }
-        this._ready = false;
+        this._ready        = false;
+        this._cacheIsReady = false;
     }
 
     get isRunning() { return !!this._proc; }
@@ -127,6 +131,9 @@ class SteamBridge extends EventEmitter {
 
     /**
      * Authenticate with stored credentials or start fresh login.
+     * Resets the cacheIsReady flag because each authenticate triggers a
+     * fresh PICS pipeline on the Python side.
+     *
      * Returns:
      *   { status: 'authenticated', steamId, personaName }
      *   { status: 'need_login',    loginUrl, endUriRegex }
@@ -134,7 +141,26 @@ class SteamBridge extends EventEmitter {
      *   { status: 'error',         message }
      */
     async authenticate(storedCredentials = null) {
-        return this._call('authenticate', { storedCredentials });
+        this._cacheIsReady = false;
+
+        // Register the listener BEFORE sending the call so we don't miss the
+        // event if the PICS pipeline finishes while authenticate is in-flight.
+        const cacheReadyPromise = new Promise((resolve) => {
+            this.once('cacheReady', resolve);
+        });
+
+        const result = await this._call('authenticate', { storedCredentials });
+
+        // If authenticated, block until the games cache is ready (or timeout).
+        // This guarantees getOwnedGames() always sees a populated cache.
+        if (result?.status === 'authenticated') {
+            await Promise.race([
+                cacheReadyPromise,
+                new Promise(r => setTimeout(r, 35_000)), // safety timeout
+            ]);
+        }
+
+        return result;
     }
 
     /**
@@ -151,6 +177,39 @@ class SteamBridge extends EventEmitter {
      */
     async getOwnedGames() {
         return this._call('get_owned_games', {});
+    }
+
+    /**
+     * Resolves as soon as the Python games cache signals it is ready
+     * (i.e. the PICS pipeline has fully resolved all packages → apps → games).
+     *
+     * If the cache is already ready (e.g. loaded from disk on the second
+     * account in a multi-account sync), this resolves immediately.
+     *
+     * Always call this between authenticate() and getOwnedGames() to avoid
+     * receiving an empty games list.
+     *
+     * @param {number} timeoutMs  Maximum wait time in ms (default 35s).
+     *                            After the timeout we resolve anyway so the
+     *                            caller can still try getOwnedGames() and get
+     *                            whatever the cache has so far.
+     */
+    waitForCacheReady(timeoutMs = 35_000) {
+        if (this._cacheIsReady) {
+            console.log('[SteamBridge] Cache already ready — skipping wait');
+            return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                console.warn(`[SteamBridge] waitForCacheReady timed out after ${timeoutMs}ms — proceeding anyway`);
+                resolve();
+            }, timeoutMs);
+
+            this.once('cacheReady', () => {
+                clearTimeout(timer);
+                resolve();
+            });
+        });
     }
 
     /**
@@ -245,6 +304,13 @@ class SteamBridge extends EventEmitter {
 
     _onEvent(event, data) {
         switch (event) {
+            case 'cache_ready':
+                // Python finished the PICS pipeline — games are now available.
+                console.log('[SteamBridge] 🎮 Games cache is ready');
+                this._cacheIsReady = true;
+                this.emit('cacheReady');
+                break;
+
             case 'games_update':
                 // New games found in background — emit so UI can update
                 this.emit('gamesUpdate', data);

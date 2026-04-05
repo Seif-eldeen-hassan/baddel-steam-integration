@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from dataclasses_json import dataclass_json
-from typing import List, Dict, Optional, Set, AsyncGenerator
+from typing import List, Dict, Optional, Set, AsyncGenerator, Callable
 import logging
 import json
 import copy
@@ -59,6 +59,10 @@ class GamesCache(ProtoCache):
 
         self._parsing_status = ParsingStatus()
 
+        # Optional async callback — called once when cache becomes ready.
+        # Set by BaddelSteamBridge to push a "cache_ready" event to Electron.
+        self.on_ready_callback: Optional[Callable] = None
+
     @property
     def version(self):
         return self._VERSION
@@ -69,7 +73,8 @@ class GamesCache(ProtoCache):
     def start_packages_import(self, steam_licenses: List[SteamLicense]):
         package_ids = self.get_package_ids()
         self._parsing_status.packages_to_parse = 0
-        logger.debug('Licenses to parse: %d, cached package_ids: %d', len(steam_licenses), package_ids)
+        # Fix: was passing the set object itself instead of its length
+        logger.debug('Licenses to parse: %d, cached package_ids: %d', len(steam_licenses), len(package_ids))
         for steam_license in steam_licenses:
             if steam_license.license.package_id in package_ids:
                 continue
@@ -166,6 +171,14 @@ class GamesCache(ProtoCache):
                 return
             logger.info("Setting state to ready")
             self._ready_event.set()
+            # on_ready_callback is a plain sync function set by BaddelSteamBridge.
+            # It internally uses call_soon_threadsafe so it's safe to call from
+            # any thread (including asyncio_0 worker threads).
+            if self.on_ready_callback:
+                try:
+                    self.on_ready_callback()
+                except Exception as e:
+                    logger.warning(f"Could not fire cache_ready callback: {e}")
         else:
             self._ready_event.clear()
 
