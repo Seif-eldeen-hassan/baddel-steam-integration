@@ -1,0 +1,7 @@
+galaxy.plugin.api>=0.69
+websockets>=11.0
+rsa>=4.9
+certifi
+protobuf>=4.0
+aiohttp>=3.8
+yarl>=1.8
