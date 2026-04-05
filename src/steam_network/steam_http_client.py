@@ -3,7 +3,7 @@ from typing import List
 
 class UnknownBackendResponse(Exception): pass
 
-from http_client import HttpClient
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from http_client import HttpClient
 
 
 logger = logging.getLogger(__name__)

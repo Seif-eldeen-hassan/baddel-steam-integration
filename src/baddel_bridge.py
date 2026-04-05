@@ -16,6 +16,11 @@ Protocol:
                   { "event": "auth_step",    "data": {...} }
 """
 
+import sys
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import asyncio
 import json
 import logging
@@ -541,7 +546,20 @@ class BaddelBridgeServer:
         loop = asyncio.get_event_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        if sys.platform == "win32":
+            # Windows: connect_read_pipe not supported, use executor thread
+            import threading
+            def _stdin_reader():
+                try:
+                    for line in sys.stdin:
+                        loop.call_soon_threadsafe(protocol.data_received, line.encode())
+                except Exception:
+                    pass
+                loop.call_soon_threadsafe(protocol.eof_received)
+            t = threading.Thread(target=_stdin_reader, daemon=True)
+            t.start()
+        else:
+            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
         logger.info("Baddel Steam Bridge ready — waiting for commands")
 
